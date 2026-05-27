@@ -1,6 +1,6 @@
 import unittest
 
-from main import chunk_message, extract_from_plain_text, parse_highlights
+from main import build_api_bullet, chunk_message, extract_from_plain_text, map_api_sector_to_category, parse_highlights
 
 
 SAMPLE_HTML = """
@@ -62,6 +62,22 @@ class ParserTest(unittest.TestCase):
 
         self.assertIn("科技 Tech", highlights)
         self.assertEqual(len(highlights["科技 Tech"]), 2)
+
+    def test_map_api_sector_to_category(self):
+        self.assertEqual(map_api_sector_to_category(["Information Technology"], []), "Tech")
+        self.assertEqual(map_api_sector_to_category(["Health Care", "Consumer Discretionary"], []), "Healthcare/Consumer crossover")
+        self.assertEqual(map_api_sector_to_category(["Utilities"], []), "Energy & Utilities")
+
+    def test_build_api_bullet(self):
+        article = {
+            "title": "Company X beats estimates",
+            "description": "Revenue rises 10% year over year.",
+            "publishedAt": "2026-05-27T12:00:00-04:00",
+            "source": {"name": "Reuters"},
+        }
+        bullet = build_api_bullet(article)
+        self.assertIn("Company X beats estimates", bullet)
+        self.assertIn("Reuters", bullet)
 
 
 if __name__ == "__main__":

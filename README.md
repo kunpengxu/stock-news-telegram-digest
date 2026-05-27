@@ -15,6 +15,7 @@ It is designed for broad market monitoring, not watchlist-only stock analysis.
 
 Set these in GitHub: **Settings > Secrets and variables > Actions > New repository secret**.
 
+- `NEWSFILTER_API_KEY` (recommended)
 - `GEMINI_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
@@ -23,7 +24,9 @@ Optional variables:
 
 - `GEMINI_MODEL` defaults to `gemini-1.5-flash`
 - `MAX_BULLETS_PER_SECTOR` defaults to `6`
+- `NEWSFILTER_LOOKBACK_HOURS` defaults to `24`
 - `DRY_RUN` defaults to `false`
+- `SEND_FALLBACK_ON_ERROR` defaults to `false`
 
 ## Telegram Setup
 
@@ -40,6 +43,14 @@ Optional variables:
 6. Find `chat.id` in the JSON response and save it as `TELEGRAM_CHAT_ID`.
 
 For group chats, add the bot to the group, send a message in the group, then use `getUpdates` the same way.
+
+## Newsfilter API Key (Recommended)
+
+1. Open: <https://newsfilter.io/api-plans>
+2. Get a Query API key.
+3. Save it as `NEWSFILTER_API_KEY` in GitHub Secrets.
+
+When `NEWSFILTER_API_KEY` is present, the script uses Newsfilter Query API first (stable on GitHub Actions), and only falls back to homepage scraping if API key is missing.
 
 ## Gemini API Key
 
@@ -67,6 +78,21 @@ schedule:
 ```
 
 GitHub cron schedules use UTC, and scheduled runs may start a few minutes late depending on GitHub Actions queueing.
+
+### Important note about access blocking
+
+`newsfilter.io` homepage scraping may be denied from some cloud runner IP ranges (including GitHub-hosted runners), returning HTTP `403` and an `Access denied` page.
+
+When this happens:
+
+- the script now fails clearly by default (instead of silently sending empty content)
+- if you prefer fallback Telegram alerts, set `SEND_FALLBACK_ON_ERROR=true`
+- this issue does not affect the Query API path when you provide `NEWSFILTER_API_KEY`
+
+If your GitHub-hosted workflow is blocked, use one of these:
+
+1. Run with a self-hosted GitHub Actions runner on your own machine/server IP.
+2. Run locally with system cron (or launchd on macOS) and keep GitHub only for source control.
 
 ## Local Run
 

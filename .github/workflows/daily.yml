@@ -29,10 +29,13 @@ jobs:
 
       - name: Send digest
         env:
+          NEWSFILTER_API_KEY: ${{ secrets.NEWSFILTER_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-1.5-flash' }}
           MAX_BULLETS_PER_SECTOR: ${{ vars.MAX_BULLETS_PER_SECTOR || '6' }}
+          NEWSFILTER_LOOKBACK_HOURS: ${{ vars.NEWSFILTER_LOOKBACK_HOURS || '24' }}
           DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
+          SEND_FALLBACK_ON_ERROR: ${{ vars.SEND_FALLBACK_ON_ERROR || 'false' }}
         run: python main.py

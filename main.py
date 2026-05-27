@@ -12,10 +12,13 @@ from bs4 import BeautifulSoup, Tag
 
 
 NEWSFILTER_URL = "https://newsfilter.io/Home"
+NEWSFILTER_API_ENDPOINT = "https://api.newsfilter.io/search"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
 DEFAULT_MAX_BULLETS_PER_SECTOR = 6
 TELEGRAM_CHUNK_LIMIT = 3900
+DEFAULT_SEND_FALLBACK_ON_ERROR = False
+DEFAULT_LOOKBACK_HOURS = 24
 
 HighlightMap = Dict[str, List[str]]
 
@@ -81,6 +84,19 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 def normalize_space(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
+
+
+def is_access_denied_text(value: str) -> bool:
+    lowered = normalize_space(value).lower()
+    markers = [
+        "access denied",
+        "forbidden",
+        "blocked",
+        "request blocked",
+        "bot detected",
+        "please contact support@newsfilter.io",
+    ]
+    return any(marker in lowered for marker in markers)
 
 
 def clean_bullet(value: str) -> str:
@@ -375,8 +391,99 @@ def fetch_static_html() -> str:
         )
     }
     response = requests.get(NEWSFILTER_URL, headers=headers, timeout=30)
+    body_sample = normalize_space(response.text)[:600]
+    if response.status_code == 403 or is_access_denied_text(body_sample):
+        raise RuntimeError(
+            f"Newsfilter blocked static access (status={response.status_code}). "
+            "This runner IP is likely denied."
+        )
     response.raise_for_status()
     return response.text
+
+
+def map_api_sector_to_category(sectors: List[str], industries: List[str]) -> str:
+    joined = " | ".join(sectors + industries)
+    lower = joined.lower()
+    if "health care" in lower or "healthcare" in lower:
+        if "consumer" in lower:
+            return "Healthcare/Consumer crossover"
+        return "Healthcare"
+    if "technology" in lower or "information technology" in lower or "communication services" in lower:
+        return "Tech"
+    if "consumer" in lower:
+        return "Consumer"
+    if "financial" in lower or "bank" in lower or "insurance" in lower or "capital markets" in lower:
+        return "Finance"
+    if "industrial" in lower or "material" in lower or "basic materials" in lower:
+        return "Industrials & Materials"
+    if "energy" in lower or "utilities" in lower:
+        return "Energy & Utilities"
+    return "Other"
+
+
+def build_api_bullet(article: dict) -> str:
+    title = normalize_space(article.get("title", ""))
+    desc = normalize_space(article.get("description", ""))
+    source = normalize_space((article.get("source") or {}).get("name", ""))
+    published_at = normalize_space(article.get("publishedAt", ""))
+
+    if not title:
+        return ""
+
+    if desc and desc.lower() not in title.lower():
+        core = f"{title} — {desc}"
+    else:
+        core = title
+
+    if source and published_at:
+        return f"{core} ({source}, {published_at})"
+    if source:
+        return f"{core} ({source})"
+    return core
+
+
+def fetch_highlights_via_api(max_bullets_per_sector: int) -> HighlightMap:
+    api_key = os.getenv("NEWSFILTER_API_KEY")
+    if not api_key:
+        return {}
+
+    lookback_hours = int(os.getenv("NEWSFILTER_LOOKBACK_HOURS", DEFAULT_LOOKBACK_HOURS))
+    query = f"publishedAt:[now-{lookback_hours}h TO *]"
+    payload = {
+        "queryString": query,
+        "size": 50,
+        "from": 0,
+        "sort": [{"publishedAt": {"order": "desc"}}],
+    }
+    headers = {"Authorization": api_key}
+
+    log(f"Fetching Newsfilter Query API ({lookback_hours}h lookback).")
+    try:
+        response = requests.post(
+            NEWSFILTER_API_ENDPOINT,
+            json=payload,
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"Newsfilter Query API request failed: {exc}") from exc
+
+    articles = data.get("articles") or []
+    if not articles:
+        raise RuntimeError("Newsfilter Query API returned no articles.")
+
+    grouped: HighlightMap = {}
+    for article in articles:
+        sector = map_api_sector_to_category(article.get("sectors") or [], article.get("industries") or [])
+        bullet = build_api_bullet(article)
+        if not bullet:
+            continue
+        grouped.setdefault(sector, []).append(bullet)
+
+    merged = merge_highlights(grouped)
+    return {k: v[:max_bullets_per_sector] for k, v in merged.items()}
 
 
 def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMap:
@@ -498,6 +605,16 @@ def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMa
                 log(f"Playwright page title: {title}")
                 log(f"Playwright final URL: {current_url}")
                 log(f"Playwright body sample: {sample}")
+                if response and response.status == 403:
+                    raise RuntimeError(
+                        "Newsfilter blocked Playwright access (HTTP 403). "
+                        "GitHub-hosted runner IP appears denied."
+                    )
+                if is_access_denied_text(sample):
+                    raise RuntimeError(
+                        "Newsfilter returned an access-denied page to Playwright. "
+                        "GitHub-hosted runner IP appears denied."
+                    )
                 html = page.content()
                 highlights = parse_highlights(html)
 
@@ -508,6 +625,14 @@ def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMa
 
 def fetch_highlights() -> HighlightMap:
     max_bullets = int(os.getenv("MAX_BULLETS_PER_SECTOR", DEFAULT_MAX_BULLETS_PER_SECTOR))
+    api_key = os.getenv("NEWSFILTER_API_KEY")
+
+    if api_key:
+        highlights = fetch_highlights_via_api(max_bullets)
+        if highlights:
+            log(f"Extracted {sum(len(v) for v in highlights.values())} bullets from Newsfilter Query API.")
+            return highlights
+
     try:
         log(f"Fetching {NEWSFILTER_URL}")
         html = fetch_static_html()
@@ -661,6 +786,7 @@ def fallback_message(reason: str) -> str:
 
 def main() -> None:
     dry_run = env_bool("DRY_RUN", False)
+    send_fallback_on_error = env_bool("SEND_FALLBACK_ON_ERROR", DEFAULT_SEND_FALLBACK_ON_ERROR)
     try:
         highlights = fetch_highlights()
         if not highlights:
@@ -670,6 +796,8 @@ def main() -> None:
         message = summarize_with_gemini(highlights)
     except Exception as exc:
         log(f"Failed to build Gemini summary: {exc}")
+        if not send_fallback_on_error:
+            raise
         message = fallback_message(str(exc))
 
     if dry_run:

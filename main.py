@@ -5,13 +5,13 @@ import sys
 import textwrap
 import time
 from datetime import date
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup, Tag
 
 
-NEWSFILTER_URL = "https://newsfilter.io/"
+NEWSFILTER_URL = "https://newsfilter.io/Home"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
 DEFAULT_MAX_BULLETS_PER_SECTOR = 6
@@ -33,8 +33,39 @@ CATEGORY_LABELS = {
     "energy and utilities": "能源与公用事业 Energy & Utilities",
     "healthcare/consumer crossover": "医疗/消费交叉 Healthcare/Consumer crossover",
     "financial services & market infrastructure": "金融服务与市场基础设施 Financial Services & Market Infrastructure",
+    "financial markets & macro": "金融市场与宏观 Financial Markets & Macro",
+    "financial markets and macro": "金融市场与宏观 Financial Markets & Macro",
+    "media, telecom & internet": "媒体、电信与互联网 Media, Telecom & Internet",
+    "media telecom & internet": "媒体、电信与互联网 Media, Telecom & Internet",
+    "media, telecom and internet": "媒体、电信与互联网 Media, Telecom & Internet",
+    "consumer (retail, travel, leisure & food)": "消费 Consumer",
+    "energy-related industrials & utilities": "能源相关工业与公用事业 Energy-Related Industrials & Utilities",
+    "energy-related industrials and utilities": "能源相关工业与公用事业 Energy-Related Industrials & Utilities",
     "other": "其他 Other",
 }
+
+KNOWN_CATEGORIES = [
+    "Tech",
+    "Healthcare",
+    "Consumer",
+    "Finance",
+    "Industrials & Materials",
+    "Energy & Utilities",
+    "Healthcare/Consumer crossover",
+    "Financial Services & Market Infrastructure",
+    "Consumer (Retail, Travel, Leisure & Food)",
+    "Financial Markets & Macro",
+    "Media, Telecom & Internet",
+    "Energy-Related Industrials & Utilities",
+    "Real Estate",
+    "Media & Entertainment",
+    "Autos & Transportation",
+    "Retail & E-Commerce",
+    "Retail & E‑Commerce",
+    "Banks & Payments",
+    "Macro & Markets",
+    "Other",
+]
 
 
 def log(message: str) -> None:
@@ -57,9 +88,16 @@ def clean_bullet(value: str) -> str:
     return re.sub(r"^[•\-\*\u2022\s]+", "", value).strip()
 
 
+def normalize_category_key(value: str) -> str:
+    value = normalize_space(value).lower()
+    value = value.replace("‑", "-")
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
 def canonical_category(value: str) -> str:
     value = normalize_space(value)
-    lowered = value.lower()
+    lowered = normalize_category_key(value)
     return CATEGORY_LABELS.get(lowered, value or "Other")
 
 
@@ -84,6 +122,71 @@ def merge_highlights(highlights: HighlightMap) -> HighlightMap:
             merged.setdefault(clean_category, [])
             merged[clean_category] = dedupe([*merged[clean_category], *clean_items])
     return merged
+
+
+def strip_button_label(value: str) -> str:
+    return re.sub(r"^\[?Button:?\]?\s*", "", normalize_space(value), flags=re.I).strip()
+
+
+def is_category_label(value: str) -> bool:
+    cleaned = strip_button_label(value)
+    return any(normalize_category_key(cleaned) == normalize_category_key(category) for category in KNOWN_CATEGORIES)
+
+
+def first_category_in_text(value: str) -> Optional[str]:
+    normalized = normalize_category_key(strip_button_label(value))
+    for category in sorted(KNOWN_CATEGORIES, key=len, reverse=True):
+        if normalize_category_key(category) in normalized:
+            return category
+    return None
+
+
+def is_noise_line(value: str) -> bool:
+    value = normalize_space(value)
+    lowered = value.lower()
+    if not value:
+        return True
+    if lowered in {"highlights", "latest news", "analyst ratings", "spacs & ipos", "fda approvals"}:
+        return True
+    if is_category_label(value):
+        return True
+    if re.fullmatch(r"(?:\[?button:?\]?\s*)?(?:" + "|".join(re.escape(c) for c in KNOWN_CATEGORIES) + r")", value, re.I):
+        return True
+    return False
+
+
+def likely_news_line(value: str) -> bool:
+    value = clean_bullet(value)
+    if is_noise_line(value):
+        return False
+    if len(value) < 40:
+        return False
+    signals = [
+        "$",
+        "%",
+        "IPO",
+        "FDA",
+        "AI",
+        "stock",
+        "shares",
+        "revenue",
+        "market",
+        "deal",
+        "merger",
+        "acquisition",
+        "earnings",
+        "sales",
+        "guidance",
+        "announced",
+        "reported",
+        "launched",
+        "filed",
+        "won",
+        "surged",
+        "fell",
+        "rose",
+    ]
+    return any(signal.lower() in value.lower() for signal in signals) or len(value) >= 100
 
 
 def find_highlights_container(soup: BeautifulSoup) -> Tag:
@@ -183,6 +286,63 @@ def extract_json_like_highlights(soup: BeautifulSoup) -> HighlightMap:
     return merge_highlights(highlights)
 
 
+def split_compact_button_lines(line: str) -> List[str]:
+    matches = re.findall(r"\[Button:\s*([^\]]+)\]", line, flags=re.I)
+    if matches:
+        return [normalize_space(match) for match in matches]
+    return [line]
+
+
+def extract_from_plain_text(text: str, active_category: Optional[str] = None) -> HighlightMap:
+    raw_lines: List[str] = []
+    for line in text.splitlines():
+        for split_line in split_compact_button_lines(line):
+            cleaned = normalize_space(split_line)
+            if cleaned:
+                raw_lines.append(cleaned)
+
+    highlights_index = next((idx for idx, line in enumerate(raw_lines) if line.lower() == "highlights"), -1)
+    if highlights_index < 0:
+        return {}
+
+    highlights: HighlightMap = {}
+    current_category = active_category
+    first_seen_category = active_category
+    bullets_seen = False
+    started = False
+
+    for line in raw_lines[highlights_index + 1 :]:
+        line = normalize_space(line)
+        if not line:
+            continue
+
+        category = first_category_in_text(line)
+        if category and (is_category_label(line) or line.lower().startswith("[button:")):
+            if not first_seen_category:
+                first_seen_category = category
+            if not active_category:
+                current_category = category
+            started = True
+            if current_category:
+                highlights.setdefault(current_category, [])
+            continue
+
+        if not started and not active_category:
+            continue
+
+        if re.match(r"^(latest news|market news|most recent|watchlist|sign in|log in)\b", line, re.I):
+            break
+
+        bullet = clean_bullet(line)
+        if current_category and likely_news_line(bullet):
+            if not bullets_seen and not active_category and first_seen_category:
+                current_category = first_seen_category
+            highlights.setdefault(current_category, []).append(bullet)
+            bullets_seen = True
+
+    return merge_highlights(highlights)
+
+
 def parse_highlights(html: str) -> HighlightMap:
     soup = BeautifulSoup(html, "html.parser")
     for noisy in soup(["script", "style", "noscript", "svg"]):
@@ -194,6 +354,10 @@ def parse_highlights(html: str) -> HighlightMap:
         highlights = extractor(container if extractor != extract_json_like_highlights else soup)
         if highlights:
             return highlights
+
+    plain_text_highlights = extract_from_plain_text(soup.get_text("\n", strip=True))
+    if plain_text_highlights:
+        return plain_text_highlights
 
     bullets = [clean_bullet(li.get_text(" ", strip=True)) for li in container.find_all("li")]
     return merge_highlights({"Other": bullets}) if bullets else {}
@@ -232,63 +396,44 @@ def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMa
             js = """
             () => {
               const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-              const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span')]
-                .filter((el) => /\\bHighlights\\b/i.test(norm(el.textContent || '')));
-              let root = headings[0] || document.body;
-              for (let i = 0; i < 8 && root.parentElement; i++) {
-                const lis = root.querySelectorAll('li').length;
-                const buttons = root.querySelectorAll('button,[role="tab"]').length;
-                if (lis || buttons >= 2) break;
-                root = root.parentElement;
-              }
               const selectors = 'button,[role="tab"],[aria-controls]';
-              return [...root.querySelectorAll(selectors)]
+              return [...document.querySelectorAll(selectors)]
                 .filter((el) => {
                   const r = el.getBoundingClientRect();
                   return r.width > 0 && r.height > 0 && norm(el.textContent);
                 })
-                .map((el, idx) => ({ idx, text: norm(el.textContent) }));
+                .map((el) => norm(el.textContent));
             }
             """
-            tabs = page.evaluate(js)
+            tab_texts = dedupe(page.evaluate(js))
+            tabs = [text for text in tab_texts if is_category_label(text)]
+            if not tabs:
+                body_text = page.locator("body").inner_text(timeout=10000)
+                tabs = [
+                    category
+                    for category in KNOWN_CATEGORIES
+                    if re.search(rf"\b{re.escape(category)}\b", body_text, re.I)
+                ]
+            log(f"Playwright visible category tabs: {', '.join(tabs) if tabs else 'none'}")
             highlights: HighlightMap = {}
 
             if tabs:
-                for tab in tabs:
-                    label = tab["text"]
-                    if label.lower() == "highlights":
-                        continue
-                    locator = page.locator("button, [role='tab'], [aria-controls]").filter(has_text=label).first
+                for label in tabs:
+                    locator = page.locator("button, [role='tab'], [aria-controls]").filter(has_text=re.compile(rf"^{re.escape(label)}$")).first
                     try:
                         locator.click(timeout=5000)
                         page.wait_for_timeout(600)
                     except Exception as exc:
                         log(f"Could not click category tab '{label}': {exc}")
-                        continue
-                    bullets = page.evaluate(
-                        """
-                        () => {
-                          const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                          const visible = (el) => {
-                            const r = el.getBoundingClientRect();
-                            return r.width > 0 && r.height > 0;
-                          };
-                          const heading = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span')]
-                            .find((el) => /\\bHighlights\\b/i.test(norm(el.textContent || '')));
-                          let root = heading || document.body;
-                          for (let i = 0; i < 8 && root.parentElement; i++) {
-                            if (root.querySelectorAll('li').length) break;
-                            root = root.parentElement;
-                          }
-                          return [...root.querySelectorAll('li')]
-                            .filter(visible)
-                            .map((li) => norm(li.textContent))
-                            .filter(Boolean);
-                        }
-                        """
-                    )
-                    if bullets:
-                        highlights[label] = bullets[:max_bullets_per_sector]
+                    body_text = page.locator("body").inner_text(timeout=10000)
+                    parsed = extract_from_plain_text(body_text, active_category=label)
+                    if not parsed:
+                        html = page.content()
+                        parsed = parse_highlights(html)
+                    for category, bullets in parsed.items():
+                        if bullets:
+                            highlights[category] = bullets[:max_bullets_per_sector]
+                    log(f"Category '{label}' yielded {sum(len(v) for v in parsed.values()) if parsed else 0} bullet(s).")
             else:
                 html = page.content()
                 highlights = parse_highlights(html)

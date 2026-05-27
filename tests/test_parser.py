@@ -1,6 +1,6 @@
 import unittest
 
-from main import chunk_message, parse_highlights
+from main import chunk_message, extract_from_plain_text, parse_highlights
 
 
 SAMPLE_HTML = """
@@ -48,6 +48,20 @@ class ParserTest(unittest.TestCase):
 
         self.assertTrue(all(len(chunk) <= 10 for chunk in chunks))
         self.assertGreater(len(chunks), 1)
+
+    def test_parse_plain_text_button_highlights(self):
+        text = """
+        Latest News
+        Highlights
+        [Button: Tech][Button: Healthcare][Button: Consumer][Button: Other]
+        * Micron’s stock surged 18%, driven by strong AI demand for its memory chips.
+        * Qualcomm shares hit record highs after a ByteDance AI data-center chip deal.
+        """
+
+        highlights = extract_from_plain_text(text)
+
+        self.assertIn("科技 Tech", highlights)
+        self.assertEqual(len(highlights["科技 Tech"]), 2)
 
 
 if __name__ == "__main__":

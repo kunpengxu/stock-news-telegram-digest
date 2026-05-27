@@ -3,7 +3,7 @@ name: Daily Newsfilter Telegram Digest
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 22 * * 1-5"
+    - cron: "0 1,10 * * *"
 
 jobs:
   digest:

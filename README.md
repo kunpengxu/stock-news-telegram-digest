@@ -51,7 +51,7 @@ The project uses the official `google-genai` SDK.
 
 ## GitHub Actions
 
-The workflow runs on weekdays at `22:30 UTC`, around after the US market close, and also supports manual runs.
+The workflow runs every day at `01:00 UTC` and `10:00 UTC`, which correspond to `09:00` and `18:00` Beijing time. It also supports manual runs.
 
 To run manually:
 
@@ -63,10 +63,10 @@ To adjust the time, edit the cron in `.github/workflows/daily.yml`:
 
 ```yaml
 schedule:
-  - cron: "30 22 * * 1-5"
+  - cron: "0 1,10 * * *"
 ```
 
-GitHub cron schedules use UTC.
+GitHub cron schedules use UTC, and scheduled runs may start a few minutes late depending on GitHub Actions queueing.
 
 ## Local Run
 

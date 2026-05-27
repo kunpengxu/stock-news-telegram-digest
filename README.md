@@ -64,6 +64,8 @@ The project uses the official `google-genai` SDK.
 
 The workflow runs every day at `01:00 UTC` and `10:00 UTC`, which correspond to `09:00` and `18:00` Beijing time. It also supports manual runs.
 
+This workflow is configured to run on a `self-hosted` runner, so GitHub still handles scheduling, but execution uses your machine/server IP (avoids the `403 Access denied` you saw on GitHub-hosted runners).
+
 To run manually:
 
 1. Go to **Actions**.
@@ -94,6 +96,17 @@ If your GitHub-hosted workflow is blocked, use one of these:
 1. Run with a self-hosted GitHub Actions runner on your own machine/server IP.
 2. Run locally with system cron (or launchd on macOS) and keep GitHub only for source control.
 
+## Set Up Self-Hosted Runner (for GitHub schedule)
+
+1. In your repo, open:
+   `Settings -> Actions -> Runners -> New self-hosted runner`
+2. Choose your OS and follow GitHub's commands on your machine.
+3. In the runner setup, use labels including `self-hosted`.
+4. Start the runner service and keep it online.
+5. Run this workflow manually once in Actions to verify Telegram delivery.
+
+When runner status is `Idle`, GitHub scheduled runs will automatically trigger and execute on your runner at the configured times.
+
 ## Local Run
 
 Use Python 3.11.
@@ -113,6 +126,59 @@ Use dry run mode to print the final message instead of sending Telegram:
 
 ```bash
 DRY_RUN=true python main.py
+```
+
+## macOS Auto Schedule (No API Plan Needed)
+
+If your Newsfilter account does not include Query API, use local scheduling on your own machine IP.
+
+1. Create local env file:
+
+```bash
+cp .env.local.example .env.local
+```
+
+2. Edit `.env.local` and set:
+
+- `GEMINI_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+3. Make sure dependencies are installed:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+4. Test once manually:
+
+```bash
+bash scripts/run_digest.sh
+```
+
+5. Install launchd scheduler:
+
+```bash
+bash scripts/install_launchd.sh
+```
+
+This job triggers every 30 minutes, and the script only runs at Beijing `09:00` and `18:00` (first 10 minutes of each window), so it stays correct even if your Mac timezone is not Asia/Shanghai.
+
+Useful commands:
+
+```bash
+# Check job
+launchctl list | rg io.kxp.newsfilter.digest
+
+# Tail logs
+tail -f logs/launchd.out.log
+tail -f logs/launchd.err.log
+
+# Remove job
+launchctl unload ~/Library/LaunchAgents/io.kxp.newsfilter.digest.plist
 ```
 
 ## Playwright Notes

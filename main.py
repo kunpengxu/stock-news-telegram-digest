@@ -15,14 +15,23 @@ NEWSFILTER_URL = "https://newsfilter.io/Home"
 NEWSFILTER_API_ENDPOINT = "https://api.newsfilter.io/search"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-DEFAULT_MAX_BULLETS_PER_SECTOR = 6
+DEFAULT_ZHIPU_MODEL = "glm-4-flash"
+DEFAULT_LLM_PROVIDER = "gemini"
+DEFAULT_MAX_BULLETS_PER_SECTOR = 20
 TELEGRAM_CHUNK_LIMIT = 3900
 DEFAULT_SEND_FALLBACK_ON_ERROR = False
 DEFAULT_LOOKBACK_HOURS = 24
+DEFAULT_ZHIPU_TIMEOUT_SECONDS = 120
+DEFAULT_LLM_MAX_BULLET_CHARS = 320
+DEFAULT_ENFORCE_EXACT_COUNTS = True
 GEMINI_FALLBACK_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
+]
+ZHIPU_FALLBACK_MODELS = [
+    "glm-4-flash",
+    "glm-4-air",
 ]
 
 HighlightMap = Dict[str, List[str]]
@@ -161,6 +170,21 @@ def merge_highlights(highlights: HighlightMap) -> HighlightMap:
             merged.setdefault(clean_category, [])
             merged[clean_category] = dedupe([*merged[clean_category], *clean_items])
     return merged
+
+
+def shorten_text(value: str, max_chars: int) -> str:
+    value = normalize_space(value)
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 1].rstrip() + "…"
+
+
+def compact_highlights_for_llm(highlights: HighlightMap) -> HighlightMap:
+    max_chars = int(os.getenv("LLM_MAX_BULLET_CHARS", DEFAULT_LLM_MAX_BULLET_CHARS))
+    compacted: HighlightMap = {}
+    for category, bullets in highlights.items():
+        compacted[category] = [shorten_text(bullet, max_chars) for bullet in bullets]
+    return compacted
 
 
 def strip_button_label(value: str) -> str:
@@ -611,15 +635,43 @@ def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMa
                         log(f"Could not click category tab '{label}': {exc}")
                     if not clicked and index > 0:
                         continue
-                    body_text = page.locator("body").inner_text(timeout=10000)
-                    parsed = extract_from_plain_text(body_text, active_category=category_name)
-                    if not parsed:
-                        html = page.content()
-                        parsed = parse_highlights(html)
-                    for category, bullets in parsed.items():
-                        if bullets:
-                            highlights[category] = bullets[:max_bullets_per_sector]
-                    log(f"Category '{label}' yielded {sum(len(v) for v in parsed.values()) if parsed else 0} bullet(s).")
+                    bullets = page.evaluate(
+                        """
+                        () => {
+                          const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                          const isVisible = (el) => {
+                            const r = el.getBoundingClientRect();
+                            const style = window.getComputedStyle(el);
+                            return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                          };
+
+                          const heading = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span')]
+                            .find((el) => /\\bHighlights\\b/i.test(norm(el.textContent || '')));
+                          let root = heading || document.body;
+                          for (let i = 0; i < 8 && root.parentElement; i++) {
+                            if (root.querySelectorAll('li').length >= 3) break;
+                            root = root.parentElement;
+                          }
+
+                          const lines = [...root.querySelectorAll('li, p')]
+                            .filter(isVisible)
+                            .map((el) => norm(el.textContent))
+                            .filter((t) => t && t.length > 30);
+
+                          return [...new Set(lines)];
+                        }
+                        """
+                    )
+
+                    clean_bullets = dedupe(clean_bullet(item) for item in bullets if clean_bullet(item))
+                    if clean_bullets:
+                        highlights[category_name] = clean_bullets[:max_bullets_per_sector]
+                        log(
+                            f"Category '{label}' yielded {len(clean_bullets)} bullet(s); sample: "
+                            f"{clean_bullets[0][:120]}"
+                        )
+                    else:
+                        log(f"Category '{label}' yielded 0 bullet(s).")
             else:
                 title = page.title()
                 current_url = page.url
@@ -641,7 +693,14 @@ def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMa
                 html = page.content()
                 highlights = parse_highlights(html)
 
-            return merge_highlights(highlights)
+            merged = merge_highlights(highlights)
+            signatures = {}
+            for category, bullets in merged.items():
+                signatures[category] = " | ".join(bullets[:2]).lower()
+            unique_signatures = {v for v in signatures.values() if v}
+            if merged and len(unique_signatures) <= 2 and len(merged) >= 4:
+                log("Warning: many categories share near-identical bullets; tab switching may not be effective.")
+            return merged
         finally:
             browser.close()
 
@@ -676,6 +735,13 @@ def fetch_highlights() -> HighlightMap:
 def build_gemini_prompt(highlights: HighlightMap) -> str:
     today = date.today().isoformat()
     payload = json.dumps(highlights, ensure_ascii=False, indent=2)
+    required_sections = [canonical_category(category) for category in highlights.keys() if highlights.get(category)]
+    required_section_text = "\n".join(f"- 【{section}】" for section in required_sections) if required_sections else "- 【其他 Other】"
+    required_counts_text = "\n".join(
+        f"- 【{canonical_category(category)}】: {len(bullets)} 条"
+        for category, bullets in highlights.items()
+        if bullets
+    )
     return textwrap.dedent(
         f"""
         你是一个美股市场新闻摘要助手。请只基于下面 Newsfilter 首页 Highlights 抓取到的英文内容，生成 Telegram 友好的中文纯文本摘要。
@@ -686,9 +752,18 @@ def build_gemini_prompt(highlights: HighlightMap) -> str:
         - 保留公司名、ticker、金额、百分比、日期和重要数字的原文形式。
         - 不提供买入、卖出、持有等投资建议。
         - 按原始 sector/category 分组；没有内容的分类不要输出。
+        - 必须覆盖“输入 JSON 中所有有内容的分类”，不得只输出单一分类。
+        - 下方“必须输出的分类标题”里每个标题都要出现。
+        - 每个分类输出条数必须严格等于“必须输出的分类与条数”中的数量，逐条对应，不得合并、删减或新增。
         - 顶部输出 3-5 条跨领域「今日重点」。
         - 末尾输出「值得关注」，列出提到的公司/股票和主题；如果无法识别则写“未明确提及”。
         - 只输出最终消息，不要解释过程。
+
+        必须输出的分类标题（逐一输出，不可遗漏）：
+        {required_section_text}
+
+        必须输出的分类与条数（严格一致）：
+        {required_counts_text}
 
         输出格式：
         📌 Newsfilter 美股新闻精选 | {today}
@@ -697,6 +772,8 @@ def build_gemini_prompt(highlights: HighlightMap) -> str:
         1. ...
         2. ...
         3. ...
+
+        【分领域摘要】
 
         【科技 Tech】
         - ...
@@ -711,13 +788,257 @@ def build_gemini_prompt(highlights: HighlightMap) -> str:
     ).strip()
 
 
-def summarize_with_gemini(highlights: HighlightMap) -> str:
+def build_exact_count_prompt(highlights: HighlightMap) -> str:
+    today = date.today().isoformat()
+    payload = json.dumps(highlights, ensure_ascii=False, indent=2)
+    required_counts_text = "\n".join(
+        f"- 【{canonical_category(category)}】: {len(bullets)} 条"
+        for category, bullets in highlights.items()
+        if bullets
+    )
+    return textwrap.dedent(
+        f"""
+        你是美股新闻翻译助手。请把输入 JSON 中每一条英文 bullet 逐条翻译成中文。
+
+        强制规则（必须遵守）：
+        - 每个分类的输出条数必须与输入完全一致。
+        - 一条输入 bullet 只能对应一条输出 bullet，禁止合并、拆分、删减、补充。
+        - 保留公司名、ticker、金额、百分比、日期和关键数字原样。
+        - 不要给投资建议。
+        - 输出 Telegram 纯文本。
+
+        输出格式：
+        📌 Newsfilter 美股新闻精选 | {today}
+
+        【今日重点】
+        1. ...
+        2. ...
+        3. ...
+
+        【分领域摘要】
+        （按下列分类顺序输出）
+
+        必须输出的分类与条数：
+        {required_counts_text}
+
+        原始 Highlights JSON：
+        {payload}
+        """
+    ).strip()
+
+
+def parse_section_bullet_counts(message: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    current: Optional[str] = None
+    for raw in message.splitlines():
+        line = raw.strip()
+        header_match = re.match(r"^【([^】]+)】$", line)
+        if header_match:
+            current = header_match.group(1).strip()
+            counts.setdefault(current, 0)
+            continue
+        if current and line.startswith("-"):
+            counts[current] = counts.get(current, 0) + 1
+    return counts
+
+
+def has_expected_section_counts(message: str, highlights: HighlightMap) -> bool:
+    parsed = parse_section_bullet_counts(message)
+    for category, bullets in highlights.items():
+        if not bullets:
+            continue
+        section = canonical_category(category)
+        if parsed.get(section, 0) < len(bullets):
+            return False
+    return True
+
+
+def build_sector_translation_prompt(category: str, bullets: List[str]) -> str:
+    payload = json.dumps(bullets, ensure_ascii=False, indent=2)
+    return textwrap.dedent(
+        f"""
+        你是财经新闻翻译助手。请将下面这个分类的英文 bullet 列表逐条翻译成中文。
+
+        强制规则：
+        - 输出条数必须与输入完全一致（{len(bullets)} 条）。
+        - 一条输入对应一条输出，禁止合并、拆分、删减、新增。
+        - 保留公司名、ticker、金额、百分比、日期和关键数字原样。
+        - 只输出 JSON 数组，不要输出 Markdown、标题、解释文字或代码块。
+        - JSON 数组长度必须是 {len(bullets)}。
+        - JSON 数组每个元素是对应的中文字符串。
+
+        分类：{category}
+        输入 bullets JSON：
+        {payload}
+        """
+    ).strip()
+
+
+def parse_bullet_lines(text: str) -> List[str]:
+    lines: List[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("-"):
+            line = clean_bullet(line)
+            if line:
+                lines.append(line)
+    return lines
+
+
+def extract_json_array(text: str) -> Optional[List[str]]:
+    text = (text or "").strip()
+    if not text:
+        return None
+    candidates = [text]
+    block_match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", text, re.S)
+    if block_match:
+        candidates.insert(0, block_match.group(1).strip())
+    bracket_match = re.search(r"\[.*\]", text, re.S)
+    if bracket_match:
+        candidates.append(bracket_match.group(0).strip())
+
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, list):
+                parsed = [normalize_space(str(item)) for item in data if normalize_space(str(item))]
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def filter_instruction_like_lines(lines: List[str]) -> List[str]:
+    blocked = [
+        "输出条数必须",
+        "一条输入对应",
+        "禁止合并",
+        "保留公司名",
+        "每行以",
+        "不要输出任何解释",
+        "只输出",
+        "json 数组",
+        "必须遵守",
+        "强制规则",
+    ]
+    clean: List[str] = []
+    for line in lines:
+        lowered = normalize_space(line).lower()
+        if any(token in lowered for token in blocked):
+            continue
+        clean.append(line)
+    return clean
+
+
+def translate_sector_with_zhipu(category: str, bullets: List[str]) -> List[str]:
+    api_key = os.getenv("ZHIPU_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing required environment variable: ZHIPU_API_KEY")
+
+    model = os.getenv("ZHIPU_MODEL", DEFAULT_ZHIPU_MODEL)
+    timeout_seconds = int(os.getenv("ZHIPU_TIMEOUT_SECONDS", DEFAULT_ZHIPU_TIMEOUT_SECONDS))
+    endpoint = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    prompt = build_sector_translation_prompt(category, bullets)
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你是一个严谨的财经翻译助手。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+    }
+
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = ((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")).strip()
+            translated = extract_json_array(text)
+            if translated is None:
+                translated = parse_bullet_lines(text)
+            translated = filter_instruction_like_lines(translated)
+            if len(translated) >= len(bullets):
+                return translated[: len(bullets)]
+            if translated:
+                padded = translated + bullets[len(translated) :]
+                return padded[: len(bullets)]
+            raise RuntimeError("Empty translation output.")
+        except requests.Timeout:
+            if attempt < 3:
+                wait_s = attempt * 2
+                log(f"Zhipu timeout translating {category} attempt {attempt}; retrying in {wait_s}s.")
+                time.sleep(wait_s)
+                continue
+            raise
+
+    raise RuntimeError(f"Failed to translate category: {category}")
+
+
+def build_message_from_translated_sections(translated: HighlightMap) -> str:
+    today = date.today().isoformat()
+    sections = [f"📌 Newsfilter 美股新闻精选 | {today}", "", "【今日重点】"]
+    top_lines: List[str] = []
+    for bullets in translated.values():
+        for bullet in bullets:
+            if bullet:
+                top_lines.append(bullet)
+            if len(top_lines) >= 5:
+                break
+        if len(top_lines) >= 5:
+            break
+    if not top_lines:
+        top_lines = ["今日暂无可用重点。"]
+    for idx, line in enumerate(top_lines[:5], start=1):
+        sections.append(f"{idx}. {line}")
+
+    sections.extend(["", "【分领域摘要】", ""])
+    for category, bullets in translated.items():
+        if not bullets:
+            continue
+        sections.append(f"【{category}】")
+        for bullet in bullets:
+            sections.append(f"- {bullet}")
+        sections.append("")
+
+    sections.append("【值得关注】")
+    sections.append("- 公司/股票：见分领域摘要")
+    sections.append("- 主题：见分领域摘要")
+    return "\n".join(sections).strip()
+
+
+def regenerate_exact_by_sector(highlights: HighlightMap) -> str:
+    provider = os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip().lower()
+    if provider != "zhipu":
+        return summarize_with_llm(highlights, exact_counts=True)
+
+    translated: HighlightMap = {}
+    for category, bullets in highlights.items():
+        if not bullets:
+            continue
+        log(f"Strict mode: translating category '{canonical_category(category)}' ({len(bullets)} bullets).")
+        translated[canonical_category(category)] = translate_sector_with_zhipu(canonical_category(category), bullets)
+
+    return build_message_from_translated_sections(translated)
+
+
+def summarize_with_gemini(highlights: HighlightMap, exact_counts: bool = False) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing required environment variable: GEMINI_API_KEY")
 
     model = os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
-    prompt = build_gemini_prompt(highlights)
+    compacted = compact_highlights_for_llm(highlights)
+    prompt = build_exact_count_prompt(compacted) if exact_counts else build_gemini_prompt(compacted)
     log(f"Calling Gemini model: {model}")
 
     from google import genai
@@ -759,6 +1080,86 @@ def summarize_with_gemini(highlights: HighlightMap) -> str:
         "Gemini API request failed after trying fallback models. "
         f"Last error: {last_error}"
     )
+
+
+def summarize_with_zhipu(highlights: HighlightMap, exact_counts: bool = False) -> str:
+    api_key = os.getenv("ZHIPU_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing required environment variable: ZHIPU_API_KEY")
+
+    model = os.getenv("ZHIPU_MODEL", DEFAULT_ZHIPU_MODEL)
+    compacted = compact_highlights_for_llm(highlights)
+    prompt = build_exact_count_prompt(compacted) if exact_counts else build_gemini_prompt(compacted)
+    log(f"Calling Zhipu model: {model}")
+
+    endpoint = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    tried = set()
+    candidates = [model, *ZHIPU_FALLBACK_MODELS]
+    last_error = None
+    timeout_seconds = int(os.getenv("ZHIPU_TIMEOUT_SECONDS", DEFAULT_ZHIPU_TIMEOUT_SECONDS))
+
+    for candidate in candidates:
+        if candidate in tried:
+            continue
+        tried.add(candidate)
+        try:
+            if candidate != model:
+                log(f"Retrying with fallback Zhipu model: {candidate}")
+            payload = {
+                "model": candidate,
+                "messages": [
+                    {"role": "system", "content": "你是一个严谨的财经新闻摘要助手。"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+            }
+            for attempt in range(1, 4):
+                try:
+                    response = requests.post(
+                        endpoint,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                        timeout=timeout_seconds,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    text = ((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")).strip()
+                    if text:
+                        return text
+                    last_error = RuntimeError(f"Zhipu model {candidate} returned empty response.")
+                    break
+                except requests.Timeout as exc:
+                    last_error = exc
+                    if attempt < 3:
+                        wait_s = attempt * 2
+                        log(f"Zhipu timeout on {candidate} attempt {attempt}; retrying in {wait_s}s.")
+                        time.sleep(wait_s)
+                        continue
+                    raise
+        except Exception as exc:
+            last_error = exc
+            err = str(exc).lower()
+            if "404" in err or "not found" in err or "429" in err or "resource_exhausted" in err:
+                log(f"Zhipu model {candidate} unavailable/quota-limited; trying next model.")
+                continue
+            raise RuntimeError(f"Zhipu API request failed: {exc}") from exc
+
+    raise RuntimeError(
+        "Zhipu API request failed after trying fallback models. "
+        f"Last error: {last_error}"
+    )
+
+
+def summarize_with_llm(highlights: HighlightMap, exact_counts: bool = False) -> str:
+    provider = os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER).strip().lower()
+    if provider == "gemini":
+        return summarize_with_gemini(highlights, exact_counts=exact_counts)
+    if provider == "zhipu":
+        return summarize_with_zhipu(highlights, exact_counts=exact_counts)
+    raise RuntimeError("Unsupported LLM_PROVIDER. Use 'gemini' or 'zhipu'.")
 
 
 def chunk_message(message: str, limit: int = TELEGRAM_CHUNK_LIMIT) -> List[str]:
@@ -844,9 +1245,12 @@ def main() -> None:
             raise RuntimeError("No Highlights were extracted from Newsfilter.")
 
         log(f"Highlights categories: {', '.join(highlights.keys())}")
-        message = summarize_with_gemini(highlights)
+        message = summarize_with_llm(highlights, exact_counts=False)
+        if env_bool("ENFORCE_EXACT_COUNTS", DEFAULT_ENFORCE_EXACT_COUNTS) and not has_expected_section_counts(message, highlights):
+            log("Summary bullets are fewer than extracted counts; regenerating with strict one-to-one mode by sector.")
+            message = regenerate_exact_by_sector(highlights)
     except Exception as exc:
-        log(f"Failed to build Gemini summary: {exc}")
+        log(f"Failed to build LLM summary: {exc}")
         if not send_fallback_on_error:
             raise
         message = fallback_message(str(exc))

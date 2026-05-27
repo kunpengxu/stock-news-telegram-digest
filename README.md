@@ -17,13 +17,19 @@ Set these in GitHub: **Settings > Secrets and variables > Actions > New reposito
 
 - `NEWSFILTER_API_KEY` (recommended)
 - `GEMINI_API_KEY`
+- `ZHIPU_API_KEY`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
 Optional variables:
 
+- `LLM_PROVIDER` defaults to `gemini` (`zhipu` is supported)
 - `GEMINI_MODEL` defaults to `gemini-2.5-flash`
-- `MAX_BULLETS_PER_SECTOR` defaults to `6`
+- `ZHIPU_MODEL` defaults to `glm-4-flash`
+- `ZHIPU_TIMEOUT_SECONDS` defaults to `120`
+- `LLM_MAX_BULLET_CHARS` defaults to `320`
+- `MAX_BULLETS_PER_SECTOR` defaults to `20`
+- `ENFORCE_EXACT_COUNTS` defaults to `true`
 - `NEWSFILTER_LOOKBACK_HOURS` defaults to `24`
 - `DRY_RUN` defaults to `false`
 - `SEND_FALLBACK_ON_ERROR` defaults to `false`
@@ -59,6 +65,15 @@ When `NEWSFILTER_API_KEY` is present, the script uses Newsfilter Query API first
 3. Save it as the GitHub secret `GEMINI_API_KEY`.
 
 The project uses the official `google-genai` SDK.
+
+## Zhipu API Key (Alternative)
+
+If you want to use Zhipu instead of Gemini:
+
+1. Create a Zhipu API key in your Zhipu console.
+2. Save it as `ZHIPU_API_KEY` in GitHub Secrets or `.env.local`.
+3. Set `LLM_PROVIDER=zhipu`.
+4. Optional: set `ZHIPU_MODEL=glm-4-flash`.
 
 ## GitHub Actions
 
@@ -128,6 +143,7 @@ DRY_RUN=true python main.py
 ```
 
 `main.py` automatically loads variables from `.env.local` if the file exists, so you do not need to run `export` each time.
+To switch to Zhipu, set `LLM_PROVIDER=zhipu` and `ZHIPU_API_KEY` in `.env.local`.
 
 If your configured Gemini model is unavailable or quota-limited (e.g., HTTP `429 RESOURCE_EXHAUSTED`), the script automatically retries with fallback models.
 
@@ -144,6 +160,7 @@ cp .env.local.example .env.local
 2. Edit `.env.local` and set:
 
 - `GEMINI_API_KEY`
+- `ZHIPU_API_KEY` (if `LLM_PROVIDER=zhipu`)
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 

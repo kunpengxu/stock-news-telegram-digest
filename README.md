@@ -22,7 +22,7 @@ Set these in GitHub: **Settings > Secrets and variables > Actions > New reposito
 
 Optional variables:
 
-- `GEMINI_MODEL` defaults to `gemini-1.5-flash`
+- `GEMINI_MODEL` defaults to `gemini-2.5-flash`
 - `MAX_BULLETS_PER_SECTOR` defaults to `6`
 - `NEWSFILTER_LOOKBACK_HOURS` defaults to `24`
 - `DRY_RUN` defaults to `false`
@@ -116,9 +116,8 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python -m playwright install chromium
-export GEMINI_API_KEY="..."
-export TELEGRAM_BOT_TOKEN="..."
-export TELEGRAM_CHAT_ID="..."
+cp .env.local.example .env.local
+# edit .env.local with your real keys
 python main.py
 ```
 
@@ -127,6 +126,10 @@ Use dry run mode to print the final message instead of sending Telegram:
 ```bash
 DRY_RUN=true python main.py
 ```
+
+`main.py` automatically loads variables from `.env.local` if the file exists, so you do not need to run `export` each time.
+
+If your configured Gemini model is unavailable or quota-limited (e.g., HTTP `429 RESOURCE_EXHAUSTED`), the script automatically retries with fallback models.
 
 ## macOS Auto Schedule (No API Plan Needed)
 

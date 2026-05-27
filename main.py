@@ -14,11 +14,16 @@ from bs4 import BeautifulSoup, Tag
 NEWSFILTER_URL = "https://newsfilter.io/Home"
 NEWSFILTER_API_ENDPOINT = "https://api.newsfilter.io/search"
 TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
-DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_MAX_BULLETS_PER_SECTOR = 6
 TELEGRAM_CHUNK_LIMIT = 3900
 DEFAULT_SEND_FALLBACK_ON_ERROR = False
 DEFAULT_LOOKBACK_HOURS = 24
+GEMINI_FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+]
 
 HighlightMap = Dict[str, List[str]]
 
@@ -73,6 +78,24 @@ KNOWN_CATEGORIES = [
 
 def log(message: str) -> None:
     print(f"[newsfilter] {message}", flush=True)
+
+
+def load_local_env(env_file: str = ".env.local") -> None:
+    if not os.path.exists(env_file):
+        return
+    try:
+        with open(env_file, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except Exception as exc:
+        log(f"Warning: failed to load {env_file}: {exc}")
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -697,18 +720,45 @@ def summarize_with_gemini(highlights: HighlightMap) -> str:
     prompt = build_gemini_prompt(highlights)
     log(f"Calling Gemini model: {model}")
 
-    try:
-        from google import genai
+    from google import genai
 
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(model=model, contents=prompt)
-        text = (response.text or "").strip()
-    except Exception as exc:
-        raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+    client = genai.Client(api_key=api_key)
+    tried = set()
+    candidates = [model, *GEMINI_FALLBACK_MODELS]
+    last_error = None
 
-    if not text:
-        raise RuntimeError("Gemini returned an empty response.")
-    return text
+    for candidate in candidates:
+        if candidate in tried:
+            continue
+        tried.add(candidate)
+        try:
+            if candidate != model:
+                log(f"Retrying with fallback Gemini model: {candidate}")
+            response = client.models.generate_content(model=candidate, contents=prompt)
+            text = (response.text or "").strip()
+            if text:
+                return text
+            last_error = RuntimeError(f"Gemini model {candidate} returned empty response.")
+        except Exception as exc:
+            last_error = exc
+            err = str(exc).lower()
+            # Retry next model when this model is unavailable or quota-exhausted.
+            if (
+                "404" in err
+                or "not_found" in err
+                or "not found" in err
+                or "429" in err
+                or "resource_exhausted" in err
+                or "quota exceeded" in err
+            ):
+                log(f"Gemini model {candidate} unavailable/quota-limited; trying next model.")
+                continue
+            raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+
+    raise RuntimeError(
+        "Gemini API request failed after trying fallback models. "
+        f"Last error: {last_error}"
+    )
 
 
 def chunk_message(message: str, limit: int = TELEGRAM_CHUNK_LIMIT) -> List[str]:
@@ -785,6 +835,7 @@ def fallback_message(reason: str) -> str:
 
 
 def main() -> None:
+    load_local_env()
     dry_run = env_bool("DRY_RUN", False)
     send_fallback_on_error = env_bool("SEND_FALLBACK_ON_ERROR", DEFAULT_SEND_FALLBACK_ON_ERROR)
     try:

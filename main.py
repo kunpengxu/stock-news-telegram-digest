@@ -317,7 +317,11 @@ def extract_from_plain_text(text: str, active_category: Optional[str] = None) ->
             continue
 
         category = first_category_in_text(line)
-        if category and (is_category_label(line) or line.lower().startswith("[button:")):
+        if category and (
+            is_category_label(line)
+            or line.lower().startswith("[button:")
+            or len(strip_button_label(line)) <= 140
+        ):
             if not first_seen_category:
                 first_seen_category = category
             if not active_category:
@@ -384,29 +388,77 @@ def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMa
 
     log("Static extraction was empty; trying Playwright-rendered page.")
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1440, "height": 1200})
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+        page = browser.new_page(
+            viewport={"width": 1440, "height": 1200},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            timezone_id="America/New_York",
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Upgrade-Insecure-Requests": "1",
+            },
+        )
+        page.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """
+        )
         try:
-            page.goto(NEWSFILTER_URL, wait_until="domcontentloaded", timeout=60000)
+            response = page.goto(NEWSFILTER_URL, wait_until="load", timeout=60000)
+            if response:
+                log(f"Playwright response status: {response.status}")
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except PlaywrightTimeoutError:
                 log("Network idle timed out; continuing with the loaded DOM.")
+            try:
+                page.wait_for_selector("text=Highlights", timeout=15000)
+            except PlaywrightTimeoutError:
+                log("Timed out waiting for Highlights text.")
 
             js = """
             () => {
               const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-              const selectors = 'button,[role="tab"],[aria-controls]';
+              const selectors = 'button,[role="tab"],[aria-controls],a,span,div';
+              const known = [
+                'Tech',
+                'Healthcare',
+                'Consumer',
+                'Finance',
+                'Industrials & Materials',
+                'Energy & Utilities',
+                'Healthcare/Consumer crossover (Healthcare already above; no duplication.)',
+                'Financial Services & Market Infrastructure (subset of Finance already captured; no duplication.)',
+                'Healthcare/Consumer crossover',
+                'Financial Services & Market Infrastructure',
+                'Other'
+              ];
               return [...document.querySelectorAll(selectors)]
                 .filter((el) => {
                   const r = el.getBoundingClientRect();
-                  return r.width > 0 && r.height > 0 && norm(el.textContent);
+                  const text = norm(el.textContent);
+                  return r.width > 0 && r.height > 0 && known.includes(text);
                 })
                 .map((el) => norm(el.textContent));
             }
             """
             tab_texts = dedupe(page.evaluate(js))
-            tabs = [text for text in tab_texts if is_category_label(text)]
+            tabs = [text for text in tab_texts if first_category_in_text(text)]
             if not tabs:
                 body_text = page.locator("body").inner_text(timeout=10000)
                 tabs = [
@@ -418,15 +470,19 @@ def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMa
             highlights: HighlightMap = {}
 
             if tabs:
-                for label in tabs:
-                    locator = page.locator("button, [role='tab'], [aria-controls]").filter(has_text=re.compile(rf"^{re.escape(label)}$")).first
+                for index, label in enumerate(tabs):
+                    category_name = first_category_in_text(label) or label
+                    clicked = False
                     try:
-                        locator.click(timeout=5000)
+                        page.get_by_text(label, exact=True).first.click(timeout=5000)
                         page.wait_for_timeout(600)
+                        clicked = True
                     except Exception as exc:
                         log(f"Could not click category tab '{label}': {exc}")
+                    if not clicked and index > 0:
+                        continue
                     body_text = page.locator("body").inner_text(timeout=10000)
-                    parsed = extract_from_plain_text(body_text, active_category=label)
+                    parsed = extract_from_plain_text(body_text, active_category=category_name)
                     if not parsed:
                         html = page.content()
                         parsed = parse_highlights(html)
@@ -435,6 +491,13 @@ def fetch_highlights_with_playwright(max_bullets_per_sector: int) -> HighlightMa
                             highlights[category] = bullets[:max_bullets_per_sector]
                     log(f"Category '{label}' yielded {sum(len(v) for v in parsed.values()) if parsed else 0} bullet(s).")
             else:
+                title = page.title()
+                current_url = page.url
+                body_text = page.locator("body").inner_text(timeout=10000)
+                sample = normalize_space(body_text)[:600]
+                log(f"Playwright page title: {title}")
+                log(f"Playwright final URL: {current_url}")
+                log(f"Playwright body sample: {sample}")
                 html = page.content()
                 highlights = parse_highlights(html)
 

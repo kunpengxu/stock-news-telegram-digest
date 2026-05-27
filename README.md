@@ -27,6 +27,7 @@ Optional variables:
 - `GEMINI_MODEL` defaults to `gemini-2.5-flash`
 - `ZHIPU_MODEL` defaults to `glm-4-flash`
 - `ZHIPU_TIMEOUT_SECONDS` defaults to `120`
+- `ZHIPU_BATCH_SIZE` defaults to `8` (strict per-sector translation batch size)
 - `LLM_MAX_BULLET_CHARS` defaults to `320`
 - `MAX_BULLETS_PER_SECTOR` defaults to `20`
 - `ENFORCE_EXACT_COUNTS` defaults to `true`

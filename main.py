@@ -24,6 +24,7 @@ DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_ZHIPU_TIMEOUT_SECONDS = 120
 DEFAULT_LLM_MAX_BULLET_CHARS = 320
 DEFAULT_ENFORCE_EXACT_COUNTS = True
+DEFAULT_ZHIPU_BATCH_SIZE = 8
 GEMINI_FALLBACK_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -938,50 +939,64 @@ def translate_sector_with_zhipu(category: str, bullets: List[str]) -> List[str]:
     model = os.getenv("ZHIPU_MODEL", DEFAULT_ZHIPU_MODEL)
     timeout_seconds = int(os.getenv("ZHIPU_TIMEOUT_SECONDS", DEFAULT_ZHIPU_TIMEOUT_SECONDS))
     endpoint = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-    prompt = build_sector_translation_prompt(category, bullets)
+    def translate_batch(batch: List[str], batch_index: int) -> List[str]:
+        prompt = build_sector_translation_prompt(category, batch)
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "你是一个严谨的财经翻译助手。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "你是一个严谨的财经翻译助手。"},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
+        last_text = ""
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=timeout_seconds,
+                )
+                response.raise_for_status()
+                data = response.json()
+                text = ((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")).strip()
+                last_text = text
+                translated = extract_json_array(text)
+                if translated is None:
+                    translated = parse_bullet_lines(text)
+                translated = filter_instruction_like_lines(translated)
+                if len(translated) >= len(batch):
+                    return translated[: len(batch)]
+                if translated:
+                    return (translated + batch[len(translated) :])[: len(batch)]
+            except requests.Timeout:
+                if attempt < 3:
+                    wait_s = attempt * 2
+                    log(f"Zhipu timeout translating {category} batch {batch_index} attempt {attempt}; retrying in {wait_s}s.")
+                    time.sleep(wait_s)
+                    continue
+                raise
+            except Exception:
+                if attempt < 3:
+                    continue
+                raise
 
-    for attempt in range(1, 4):
-        try:
-            response = requests.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=timeout_seconds,
-            )
-            response.raise_for_status()
-            data = response.json()
-            text = ((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")).strip()
-            translated = extract_json_array(text)
-            if translated is None:
-                translated = parse_bullet_lines(text)
-            translated = filter_instruction_like_lines(translated)
-            if len(translated) >= len(bullets):
-                return translated[: len(bullets)]
-            if translated:
-                padded = translated + bullets[len(translated) :]
-                return padded[: len(bullets)]
-            raise RuntimeError("Empty translation output.")
-        except requests.Timeout:
-            if attempt < 3:
-                wait_s = attempt * 2
-                log(f"Zhipu timeout translating {category} attempt {attempt}; retrying in {wait_s}s.")
-                time.sleep(wait_s)
-                continue
-            raise
+        snippet = normalize_space(last_text)[:180]
+        raise RuntimeError(f"Empty translation output in {category} batch {batch_index}. Snippet: {snippet}")
 
-    raise RuntimeError(f"Failed to translate category: {category}")
+    batch_size = int(os.getenv("ZHIPU_BATCH_SIZE", DEFAULT_ZHIPU_BATCH_SIZE))
+    translated_all: List[str] = []
+    for i in range(0, len(bullets), batch_size):
+        batch = bullets[i : i + batch_size]
+        batch_index = (i // batch_size) + 1
+        log(f"Translating {category} batch {batch_index} ({len(batch)} bullets).")
+        translated_all.extend(translate_batch(batch, batch_index))
+    return translated_all[: len(bullets)]
 
 
 def build_message_from_translated_sections(translated: HighlightMap) -> str:
